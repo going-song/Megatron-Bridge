@@ -76,6 +76,7 @@ class DirectHFSFTDatasetConfig(DataloaderConfig):
     pad_to_max_length: bool = False
     pad_to_multiple_of: int = 128
     in_batch_packing_pad_to_multiple_of: int = 1
+    megatron_mimo_scalable_dp: bool = False
 
     def validate(self) -> None:
         """Validate declarative source and dataset settings."""

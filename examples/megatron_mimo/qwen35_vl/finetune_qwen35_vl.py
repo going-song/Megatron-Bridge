@@ -416,6 +416,7 @@ def _build_dataset_config(args: argparse.Namespace) -> DirectHFSFTDatasetConfig:
         # MegatronMIMO packs in the step, after the module-DP slice (deferred packing).
         enable_in_batch_packing=args.pack_sequences_in_batch,
         defer_in_batch_packing_to_step=True,
+        megatron_mimo_scalable_dp=args.scalable_dp,
         do_validation=do_validation,
         do_test=False,
         trust_remote_code=args.trust_remote_code,
@@ -857,9 +858,11 @@ def _make_build_data_iterators(spec: Qwen35MIMOHFSpec, args: argparse.Namespace)
         if cfg.model._grids is None:
             raise ValueError("MegatronMIMOProvider._grids is None. Model must be built before data iterators.")
 
+        scalable_dp = bool(getattr(cfg.dataset, "megatron_mimo_scalable_dp", False))
         sampler_dp_rank, sampler_dp_size, needs_data = get_megatron_mimo_sampling_info(
             cfg.model.megatron_mimo_parallelism_config,
             cfg.model._grids,
+            scalable_dp=scalable_dp,
         )
         if not needs_data:
             return None, None
@@ -909,11 +912,18 @@ def _make_build_data_iterators(spec: Qwen35MIMOHFSpec, args: argparse.Namespace)
                 batch_spec=batch_spec,
             )
 
+        # With scalable data parallelism each rank reads only its 1/dp slice, so the per-rank
+        # micro-batch is micro_batch_size // dp. Otherwise dp_size == 1 and each rank reads the
+        # full micro-batch.
+        per_rank_micro_batch_size = cfg.train.micro_batch_size
+        if scalable_dp:
+            per_rank_micro_batch_size = cfg.train.micro_batch_size // sampler_dp_size
+
         train_loader = build_pretraining_data_loader(
             dataset=train_ds,
             consumed_samples=train_state.consumed_train_samples,
             dataloader_type=cfg.dataset.dataloader_type,
-            micro_batch_size=cfg.train.micro_batch_size,
+            micro_batch_size=per_rank_micro_batch_size,
             num_workers=cfg.dataset.num_workers,
             data_sharding=cfg.dataset.data_sharding,
             collate_fn=collate_fn,
@@ -1229,6 +1239,14 @@ def _parse_args() -> argparse.Namespace:
         help="Enable MegatronMIMO in-batch sequence packing: pack each language DP shard's real "
         "tokens into one [1, T] THD sequence so the language model skips padding compute "
         "(block-diagonal attention comes from cu_seqlens).",
+    )
+    parser.add_argument(
+        "--scalable-dp",
+        action="store_true",
+        help="Scalable data parallelism: each rank reads only its disjoint 1/dp shard of the global "
+        "micro-batch instead of every rank reading the full batch and slicing locally (IO scales with "
+        "DP). Each rank processes its natural, unbalanced shard. Uses the same DP loss reduction as "
+        "non-scalable runs.",
     )
     parser.add_argument("--profile", choices=("none", "nsys", "pytorch"), default="none")
     parser.add_argument("--profile-step-start", type=int, default=1)

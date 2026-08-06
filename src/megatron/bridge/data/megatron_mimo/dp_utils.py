@@ -172,22 +172,29 @@ def get_megatron_mimo_dp_info(
 def get_megatron_mimo_sampling_info(
     megatron_mimo_cfg: "MegatronMIMOParallelismConfig",
     grids: Dict[str, "HyperCommGrid"],
+    *,
+    scalable_dp: bool = False,
 ) -> Tuple[int, int, bool]:
     """Get sampler DP rank, size, and data-loading flag for MegatronMIMO.
 
-    In heterogeneous MegatronMIMO, modules may have different DP sizes.  The data
-    loader must give every data-loading rank the **same global micro-batch**
-    so that :func:`slice_batch_for_megatron_mimo` (called in the forward step) can
-    sub-shard it consistently with the :class:`BridgeCommunicator` fan-in /
-    fan-out routing.
+    In heterogeneous MegatronMIMO, modules may have different DP sizes.
 
-    This function therefore returns ``dp_size=1, dp_rank=0`` for all ranks,
-    disabling DP sharding at the sampler level.  Per-module DP sharding is
-    deferred to :func:`slice_batch_for_megatron_mimo`.
+    **Default (full-batch reads).** Returns ``dp_size=1, dp_rank=0`` for all ranks, so the data
+    loader gives every data-loading rank the **same global micro-batch**; per-module DP sharding
+    is deferred to :func:`slice_batch_for_megatron_mimo` in the forward step, consistent with the
+    :class:`BridgeCommunicator` fan-in / fan-out routing.
+
+    **Scalable data parallelism (``scalable_dp=True``).** Returns this rank's **module-local**
+    ``(dp_rank, dp_size)`` so the sampler hands each rank only its disjoint scalable-data-parallel
+    shard (the caller must set the loader's per-rank ``micro_batch_size`` to
+    ``global_micro_batch // dp``), and the forward step does **not** slice again. Each rank then
+    processes its natural, unbalanced ``1/dp`` shard: this is the read-sharding win on its own,
+    with no cross-rank exchange.
 
     Args:
         megatron_mimo_cfg: MegatronMIMO parallelism configuration.
         grids: Module name to HyperCommGrid mapping.
+        scalable_dp: When ``True``, shard reads at the sampler (module-local DP).
 
     Returns:
         Tuple of (sampler_dp_rank, sampler_dp_size, needs_data).
@@ -197,9 +204,24 @@ def get_megatron_mimo_sampling_info(
         return 0, 1, False
 
     needs_data = _needs_data_for_module(my_grid, my_module)
-    # All data-loading ranks use the same sampler settings so they load
-    # identical global micro-batches.  Module-local DP slicing happens later
-    # in forward_step via slice_batch_for_megatron_mimo.
+    if scalable_dp:
+        module_parallelism = megatron_mimo_cfg.module_parallelisms[my_module]
+        if module_parallelism.expert_tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "MegatronMIMO scalable_dp currently requires expert_tensor_parallel_size=1. "
+                "Sharding sampler reads across the module DP group with ETP > 1 is an "
+                "unvalidated combination, so it is conservatively rejected."
+            )
+        # Disjoint reads: each rank's sampler emits only its module-local DP shard.
+        dp_pg = my_grid.get_pg(["dp"])
+        if dp_pg.size() != module_parallelism.data_parallel_size:
+            raise RuntimeError(
+                f"MegatronMIMO scalable_dp expected module {my_module!r} data-parallel size "
+                f"{module_parallelism.data_parallel_size}, but its base DP group has size {dp_pg.size()}."
+            )
+        return dp_pg.rank(), dp_pg.size(), needs_data
+    # All data-loading ranks use the same sampler settings so they load identical global
+    # micro-batches; module-local DP slicing happens later in forward_step.
     return 0, 1, needs_data
 
 
